@@ -30,11 +30,13 @@ import homeassistant.helpers.config_validation as cv
 _LOGGER = logging.getLogger(__name__)
 
 CONF_SOURCES = "sources"
+CONF_FAKEVOLUMESET = "fakevolumeset"
 
 DEFAULT_NAME = "Pioneer AVR"
 DEFAULT_PORT = 23  # telnet default. Some Pioneer AVRs use 8102
 DEFAULT_TIMEOUT = None
 DEFAULT_SOURCES = {}
+DEFAULT_FAKEVOLUMESET = False
 
 SUPPORT_PIONEER = (
     SUPPORT_PAUSE
@@ -59,6 +61,7 @@ PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
         vol.Optional(CONF_PORT, default=DEFAULT_PORT): cv.port,
         vol.Optional(CONF_TIMEOUT, default=DEFAULT_TIMEOUT): cv.socket_timeout,
         vol.Optional(CONF_SOURCES, default=DEFAULT_SOURCES): {cv.string: cv.string},
+        vol.Optional(CONF_FAKEVOLUMESET, default=DEFAULT_FAKEVOLUMESET) : cv.boolean,
     }
 )
 
@@ -71,6 +74,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
         config[CONF_PORT],
         config[CONF_TIMEOUT],
         config[CONF_SOURCES],
+        config[CONF_FAKEVOLUMESET],
     )
 
     if pioneer.update():
@@ -82,7 +86,7 @@ def setup_platform(hass, config, add_entities, discovery_info=None):
 class PioneerDevice(MediaPlayerDevice):
     """Representation of a Pioneer device."""
 
-    def __init__(self, name, host, port, timeout, sources):
+    def __init__(self, name, host, port, timeout, sources, fakevolumeset):
         """Initialize the Pioneer device."""
         self._name = name
         self._host = host
@@ -94,6 +98,8 @@ class PioneerDevice(MediaPlayerDevice):
         self._selected_source = ""
         self._source_name_to_number = sources
         self._source_number_to_name = {v: k for k, v in sources.items()}
+        self._fakevolumeset = fakevolumeset
+        self._vol_inc_steps = None
 
     @classmethod
     def telnet_request(cls, telnet, command, expected_prefix):
@@ -255,6 +261,46 @@ class PioneerDevice(MediaPlayerDevice):
 
     def set_volume_level(self, volume):
         """Set volume level, range 0..1."""
+        if self._fakevolumeset:
+            tries = MAX_TRIES
+            while tries > 0:
+                tries = tries - 1
+                try:
+                    telnet = telnetlib.Telnet(self._host, self._port, self._timeout)
+                    target_steps = int(volume * MAX_VOLUME)
+                    cmd = "VU" if (volume > self._volume) else "VD"
+
+                    if self._vol_inc_steps == None:
+                        # VU and VD increase/decrease volumes in fixed steps (usually 2 but not known for all devices), probe if unknown:
+                        volume_str1 = self.telnet_request(telnet, "VU", "VOL")
+                        volume_str2 = self.telnet_request(telnet, "VD", "VOL")
+                        if volume_str1 and volume_str2:
+                            vol1 = int(volume_str1[3:])
+                            vol2 = int(volume_str2[3:])
+                            self._vol_inc_steps = abs(vol2 - vol1)
+                        else:
+                            _LOGGER.error("No response from {} while probing step size".format(self._name))
+                            time.sleep(TRY_DELAY)
+                            continue
+
+                    while abs(target_steps - int(self._volume *MAX_VOLUME)) >= self._vol_inc_steps:
+                        volume_str = self.telnet_request(telnet, cmd, "VOL")
+                        if volume_str:
+                            current_steps = int(volume_str[3:])
+                            self._volume = current_steps / MAX_VOLUME
+                        else:
+                            _LOGGER.error("No response from {} while fake setting volume".format(self._name))
+                            break
+
+                    self._volume = target_steps / MAX_VOLUME
+                    telnet.close()
+                    break
+                except (ConnectionRefusedError, OSError):
+                    _LOGGER.debug("Pioneer %s refused connection", self._name)
+                    time.sleep(TRY_DELAY)
+                    continue
+            if tries == 0: _LOGGER.warning("Tried %d times, but Pioneer %s still refused connection", MAX_TRIES, self._name)
+        else:
         # 60dB max
         self.telnet_command(f"{round(volume * MAX_VOLUME):03}VL")
 
